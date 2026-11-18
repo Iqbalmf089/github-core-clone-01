@@ -1,3 +1,8 @@
+// Forge entrypoint: this file only boots the app and runs the trial lifecycle.
+// The GitHub-compatible forge itself — repos, issues, pull requests, GraphQL, MCP —
+// is assembled in app.ts; main.ts just binds it to a port, registers that port with
+// the harness, and waits for the harness to declare the trial finished before
+// shutting the server down and exiting cleanly.
 // The entry <-> env lifecycle, as env/src/wire.ts settles it: bind an ephemeral port, tell the env the
 // port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
 // the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
