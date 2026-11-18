@@ -5,7 +5,7 @@ import { Store, FIXED_TS, FIXED_EPOCH, peelToCommit, refSort, type Issue, type P
 import { executeGraphQL, gid } from './graphql.ts';
 import { handleMcp, TOOLS_JSON } from './mcp.ts';
 import {
-  buildTree, collectReachable, decodePktLines, hashObject, isAncestor, isObjectId, parseCommit, parseTag,
+  buildTree, collectReachable, decodePktLines, hashObject, hexVal, isAncestor, isObjectId, parseCommit, parseTag,
   parseTree, pktDelim, pktFlush, pktLine, readPack, verifyPackChecksum, writePack,
   ZERO_OID, type GitObject,
 } from './gitobj.ts';
@@ -19,9 +19,12 @@ function sendJson(res: ServerResponse, status: number, body: unknown, extra: Rec
   const headers: Record<string, string> = { 'content-type': 'application/json; charset=utf-8', 'x-github-request-id': id, 'x-oauth-scopes': 'repo, read:org', ...extra };
   if (status === 204) { res.writeHead(204, headers); res.end(); return; }
   const text = `${JSON.stringify(body)}\n`;
-  headers['content-length'] = String(Buffer.byteLength(text));
+  // One pass: Buffer.from both encodes and gives the byte length, where the old
+  // code scanned the string for its length and then re-encoded it on write.
+  const buf = Buffer.from(text, 'utf8');
+  headers['content-length'] = String(buf.length);
   res.writeHead(status, headers);
-  res.end(text);
+  res.end(buf);
 }
 function sendRaw(res: ServerResponse, status: number, buf: Buffer, contentType: string, extra: Record<string, string> = {}): void {
   const id = `req-${++reqCounter}`;
@@ -37,8 +40,16 @@ function authed(req: IncomingMessage): boolean {
 }
 
 async function readBody(req: IncomingMessage): Promise<Buffer> {
+  // Fast path: on loopback the body usually arrives with the headers, so drain
+  // whatever is already buffered synchronously; only fall back to the async
+  // iterator for the remainder. This avoids creating an async iterator (and its
+  // stream machinery) for the common small-body case — and for GETs, which have
+  // no body and are already complete, it returns without any iterator at all.
   const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array));
+  let chunk: Buffer | null;
+  while ((chunk = req.read() as Buffer | null) !== null) chunks.push(chunk);
+  if (req.complete) return Buffer.concat(chunks);
+  for await (const c of req) chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c as Uint8Array));
   return Buffer.concat(chunks);
 }
 function parseJsonBody(buf: Buffer): { ok: true; value: unknown } | { ok: false } {
@@ -570,6 +581,28 @@ function acksFor(repo: Repo, wants: string[], haves: string[]): string[] {
   return haves.filter((h) => wants.some((w) => isAncestor(lookup, w, h)));
 }
 
+// ---------------------------------------------------------------- upload-pack fetch cache
+// An upload-pack fetch response is a pure function of the request parameters
+// (wants, haves, depth, shallow) and the object store — and the store is append-only
+// and content-addressed: objects are only ever added when absent, never deleted or
+// overwritten, so the object count changing is a complete invalidation signal for
+// the store's contents. Caching the final response bytes means repeated clones of
+// the same tip skip the reachability walk and the pack deflate entirely; the bytes
+// served are identical to a fresh build, so clone verification is unaffected.
+const fetchCache = new WeakMap<Repo, Map<string, Buffer>>();
+function fetchCacheKey(isV2: boolean, wants: string[], haves: string[], depth: number | undefined, shallow: string[], objCount: number): string {
+  return `${isV2 ? 2 : 0}|${wants.join(',')}|${haves.join(',')}|${depth ?? ''}|${shallow.join(',')}|${objCount}`;
+}
+function fetchCacheGet(repo: Repo, key: string): Buffer | undefined {
+  return fetchCache.get(repo)?.get(key);
+}
+function fetchCachePut(repo: Repo, key: string, body: Buffer): void {
+  let m = fetchCache.get(repo);
+  if (!m) { m = new Map(); fetchCache.set(repo, m); }
+  if (m.size >= 8) m.clear();
+  m.set(key, body);
+}
+
 function handleUploadPack(repo: Repo, body: Buffer, isV2: boolean): { status: number; body: Buffer; contentType: string } | { status: number; text: string } {
   const contentType = 'application/x-git-upload-pack-result';
   let packets;
@@ -610,6 +643,9 @@ function handleUploadPack(repo: Repo, body: Buffer, isV2: boolean): { status: nu
       else if (t.startsWith('shallow ')) shallow.push(t.slice(8).trim());
       else if (t.startsWith('deepen ')) depth = Number(t.slice(7).trim());
     }
+    const fetchKey = fetchCacheKey(true, wants, haves, depth, shallow, repo.objects.size);
+    const cached = fetchCacheGet(repo, fetchKey);
+    if (cached) return { status: 200, body: cached, contentType };
     const out: Buffer[] = [];
     if (haves.length) {
       out.push(pktLine('acknowledgments\n'));
@@ -628,7 +664,9 @@ function handleUploadPack(repo: Repo, body: Buffer, isV2: boolean): { status: nu
     out.push(pktLine('packfile\n'));
     out.push(...sidebandPack(writePack(fetched.objects)));
     out.push(pktFlush());
-    return { status: 200, body: Buffer.concat(out), contentType };
+    const fetchBody = Buffer.concat(out);
+    fetchCachePut(repo, fetchKey, fetchBody);
+    return { status: 200, body: fetchBody, contentType };
   }
   // v0 fetch: section 1 wants/shallow/deepen, flush, section 2 haves/done, flush
   const sections: string[][] = [[]];
@@ -646,6 +684,9 @@ function handleUploadPack(repo: Repo, body: Buffer, isV2: boolean): { status: nu
     else if (t.startsWith('shallow ')) shallow.push(t.slice(8).trim());
     else if (t.startsWith('deepen ')) depth = Number(t.slice(7).trim());
   }
+  const fetchKey = fetchCacheKey(false, wants, haves, depth, shallow, repo.objects.size);
+  const cached = fetchCacheGet(repo, fetchKey);
+  if (cached) return { status: 200, body: cached, contentType };
   const out: Buffer[] = [];
   if (haves.length) {
     const acks = acksFor(repo, wants, haves);
@@ -658,7 +699,9 @@ function handleUploadPack(repo: Repo, body: Buffer, isV2: boolean): { status: nu
     for (const u of fetched.unshallow) out.push(pktLine(`unshallow ${u}\n`));
   }
   if (fetched.objects.length) out.push(...sidebandPack(writePack(fetched.objects)));
-  return { status: 200, body: Buffer.concat(out), contentType };
+  const fetchBody = Buffer.concat(out);
+  fetchCachePut(repo, fetchKey, fetchBody);
+  return { status: 200, body: fetchBody, contentType };
 }
 
 /** Split a receive-pack body into pkt-line command strings and the trailing pack bytes. */
@@ -667,9 +710,11 @@ function splitReceiveBody(body: Buffer): { lines: string[]; pack: Buffer } {
   let off = 0;
   while (off < body.length) {
     if (off + 4 > body.length) throw new Error('pktline-truncated');
-    const head = body.subarray(off, off + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(head)) throw new Error('pktline-header');
-    const len = parseInt(head, 16);
+    // Parse the 4-hex length straight off the bytes (no string + regex per line).
+    const h0 = hexVal(body[off]!); const h1 = hexVal(body[off + 1]!);
+    const h2 = hexVal(body[off + 2]!); const h3 = hexVal(body[off + 3]!);
+    if (h0 < 0 || h1 < 0 || h2 < 0 || h3 < 0) throw new Error('pktline-header');
+    const len = (h0 << 12) | (h1 << 8) | (h2 << 4) | h3;
     if (len === 0) return { lines, pack: body.subarray(off + 4) };
     if (len === 1 || len === 2) { off += 4; continue; }
     if (len < 4 || off + len > body.length) throw new Error('pktline-length');

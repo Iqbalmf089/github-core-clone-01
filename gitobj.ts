@@ -187,25 +187,40 @@ export function buildTreeFromFiles(flat: Map<string, { oid: string; mode: string
 export function pktLine(payload: string | Buffer): Buffer {
   const data = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
   if (data.length > PKT_LINE_MAX - 4) throw new Error('pktline-too-long');
-  const head = Buffer.allocUnsafe(4);
-  head.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
-  return Buffer.concat([head, data]);
+  // One allocation: header + payload in a single buffer instead of a concat.
+  const out = Buffer.allocUnsafe(data.length + 4);
+  out.write((data.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  data.copy(out, 4);
+  return out;
 }
-export const pktFlush = (): Buffer => Buffer.from('0000', 'ascii');
-export const pktDelim = (): Buffer => Buffer.from('0001', 'ascii');
+// Flush/delim markers are immutable 4-byte constants shared by every response:
+// they are only ever Buffer.concat'd, never written into.
+const FLUSH_BUF = Buffer.from('0000', 'ascii');
+const DELIM_BUF = Buffer.from('0001', 'ascii');
+export const pktFlush = (): Buffer => FLUSH_BUF;
+export const pktDelim = (): Buffer => DELIM_BUF;
 
 export interface Pkt { kind: 'data' | 'flush' | 'delim' | 'response-end'; payload: Buffer; }
+const EMPTY_BUF = Buffer.alloc(0);
+/** Value of one hex digit, or -1 for a non-hex byte (avoids a string + regex per packet). */
+export function hexVal(b: number): number {
+  if (b >= 48 && b <= 57) return b - 48;
+  if (b >= 97 && b <= 102) return b - 87;
+  if (b >= 65 && b <= 70) return b - 55;
+  return -1;
+}
 export function decodePktLines(buf: Buffer): Pkt[] {
   const out: Pkt[] = [];
   let off = 0;
   while (off < buf.length) {
     if (off + 4 > buf.length) throw new Error('pktline-truncated');
-    const head = buf.subarray(off, off + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(head)) throw new Error(`pktline-header ${JSON.stringify(head)}`);
-    const len = parseInt(head, 16);
-    if (len === 0) { out.push({ kind: 'flush', payload: Buffer.alloc(0) }); off += 4; continue; }
-    if (len === 1) { out.push({ kind: 'delim', payload: Buffer.alloc(0) }); off += 4; continue; }
-    if (len === 2) { out.push({ kind: 'response-end', payload: Buffer.alloc(0) }); off += 4; continue; }
+    const h0 = hexVal(buf[off]!); const h1 = hexVal(buf[off + 1]!);
+    const h2 = hexVal(buf[off + 2]!); const h3 = hexVal(buf[off + 3]!);
+    if (h0 < 0 || h1 < 0 || h2 < 0 || h3 < 0) throw new Error(`pktline-header ${JSON.stringify(buf.subarray(off, off + 4).toString('ascii'))}`);
+    const len = (h0 << 12) | (h1 << 8) | (h2 << 4) | h3;
+    if (len === 0) { out.push({ kind: 'flush', payload: EMPTY_BUF }); off += 4; continue; }
+    if (len === 1) { out.push({ kind: 'delim', payload: EMPTY_BUF }); off += 4; continue; }
+    if (len === 2) { out.push({ kind: 'response-end', payload: EMPTY_BUF }); off += 4; continue; }
     if (len < 4 || len > PKT_LINE_MAX) throw new Error('pktline-length');
     if (off + len > buf.length) throw new Error('pktline-truncated');
     out.push({ kind: 'data', payload: buf.subarray(off + 4, off + len) });
@@ -250,9 +265,10 @@ export function writePack(objects: Iterable<GitObject>): Buffer {
 
 export function verifyPackChecksum(pack: Buffer): boolean {
   if (pack.length < 20) return false;
-  const actual = pack.subarray(pack.length - 20).toString('hex');
-  const expected = createHash('sha1').update(pack.subarray(0, pack.length - 20)).digest('hex');
-  return actual === expected;
+  // Compare digests as buffers instead of hex-encoding both sides first.
+  const actual = pack.subarray(pack.length - 20);
+  const expected = createHash('sha1').update(pack.subarray(0, pack.length - 20)).digest();
+  return actual.equals(expected);
 }
 
 function readVarintSize(buffer: Buffer, start: number): { size: number; next: number; first: number } {
